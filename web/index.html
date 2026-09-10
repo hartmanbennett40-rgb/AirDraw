@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AirDraw</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0;
+    background: #111418;
+    color: #eee;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 16px;
+    box-sizing: border-box;
+  }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+  #status { font-size: 13px; color: #9aa4b2; margin-bottom: 12px; min-height: 18px; }
+  .stage {
+    position: relative;
+    width: 100%;
+    max-width: 720px;
+    aspect-ratio: 4 / 3;
+    background: #000;
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  canvas#view { width: 100%; height: 100%; display: block; }
+  video { display: none; }
+  .toolbar {
+    width: 100%;
+    max-width: 720px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    margin-top: 12px;
+  }
+  .swatch {
+    width: 30px;
+    height: 30px;
+    border-radius: 6px;
+    border: 2px solid transparent;
+    cursor: pointer;
+    padding: 0;
+  }
+  .swatch.active { border-color: #fff; }
+  button.action {
+    background: #2a2f3a;
+    color: #eee;
+    border: 1px solid #3a4150;
+    border-radius: 6px;
+    padding: 7px 12px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button.action:hover { background: #343b47; }
+  button.action:disabled { opacity: 0.5; cursor: not-allowed; }
+  #startBtn { background: #2f6f4f; border-color: #3a8a63; }
+  #startBtn:hover { background: #368058; }
+  .hint {
+    font-size: 12px;
+    color: #7c8695;
+    margin-top: 10px;
+    max-width: 720px;
+    line-height: 1.5;
+  }
+</style>
+</head>
+<body>
+  <h1>AirDraw</h1>
+  <div id="status">Click Start, then allow camera access.</div>
+
+  <div class="stage">
+    <video id="video" playsinline></video>
+    <canvas id="view"></canvas>
+  </div>
+
+  <div class="toolbar">
+    <button id="startBtn" class="action">Start camera</button>
+    <span id="swatches"></span>
+    <button id="clearBtn" class="action" disabled>Clear (c)</button>
+    <button id="undoBtn" class="action" disabled>Undo (z)</button>
+    <button id="saveBtn" class="action" disabled>Save PNG (s)</button>
+  </div>
+
+  <p class="hint">
+    Pinch thumb and index finger together to draw; release to lift the pen.
+    Keys 1-5 pick a color. Runs entirely in your browser — the video never
+    leaves your machine. Needs a webcam and, in most browsers, an
+    <code>https://</code> or <code>http://localhost</code> origin (see
+    launch instructions).
+  </p>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script>
+(() => {
+  "use strict";
+
+  const COLORS = ["#ff3b3b", "#3bff5c", "#3b83ff", "#f6ff3b", "#ff3bf0"];
+  const THUMB_TIP = 4, INDEX_TIP = 8, WRIST = 0, MIDDLE_MCP = 9;
+  const PINCH_THRESHOLD = 0.12;
+  const DEBOUNCE_FRAMES = 3;
+
+  const video = document.getElementById("video");
+  const canvas = document.getElementById("view");
+  const ctx = canvas.getContext("2d");
+  const statusEl = document.getElementById("status");
+  const startBtn = document.getElementById("startBtn");
+  const clearBtn = document.getElementById("clearBtn");
+  const undoBtn = document.getElementById("undoBtn");
+  const saveBtn = document.getElementById("saveBtn");
+  const swatchesEl = document.getElementById("swatches");
+
+  let colorIndex = 0;
+  let strokes = [];
+  let activeStroke = null;
+
+  let isPinching = false;
+  let pendingState = null;
+  let pendingCount = 0;
+
+  let lastFingertip = null;
+  let lastFound = false;
+
+  COLORS.forEach((color, i) => {
+    const b = document.createElement("button");
+    b.className = "swatch" + (i === 0 ? " active" : "");
+    b.style.background = color;
+    b.title = `Color ${i + 1}`;
+    b.addEventListener("click", () => selectColor(i));
+    swatchesEl.appendChild(b);
+  });
+
+  function selectColor(i) {
+    colorIndex = i;
+    [...swatchesEl.children].forEach((el, idx) => el.classList.toggle("active", idx === i));
+  }
+
+  function debouncePinch(rawPinch) {
+    if (rawPinch === isPinching) {
+      pendingState = null;
+      pendingCount = 0;
+      return;
+    }
+    if (rawPinch === pendingState) {
+      pendingCount += 1;
+    } else {
+      pendingState = rawPinch;
+      pendingCount = 1;
+    }
+    if (pendingCount >= DEBOUNCE_FRAMES) {
+      const wasPinching = isPinching;
+      isPinching = rawPinch;
+      pendingState = null;
+      pendingCount = 0;
+
+      if (isPinching && !wasPinching && lastFingertip) {
+        activeStroke = { points: [[...lastFingertip]], color: COLORS[colorIndex], width: 4 };
+        strokes.push(activeStroke);
+      } else if (!isPinching && wasPinching) {
+        activeStroke = null;
+      }
+    }
+  }
+
+  function onResults(results) {
+    const w = canvas.width, h = canvas.height;
+    ctx.save();
+    ctx.translate(w, 0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(results.image, 0, 0, w, h);
+    ctx.restore();
+
+    for (const stroke of strokes) {
+      if (stroke.points.length < 2) continue;
+      ctx.strokeStyle = stroke.color;
+      ctx.lineWidth = stroke.width;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.beginPath();
+      ctx.moveTo(stroke.points[0][0], stroke.points[0][1]);
+      for (let i = 1; i < stroke.points.length; i++) {
+        ctx.lineTo(stroke.points[i][0], stroke.points[i][1]);
+      }
+      ctx.stroke();
+    }
+
+    const landmarks = results.multiHandLandmarks && results.multiHandLandmarks[0];
+    if (landmarks) {
+      const indexTip = landmarks[INDEX_TIP];
+      const fingertip = [w - indexTip.x * w, indexTip.y * h];
+      lastFingertip = fingertip;
+      lastFound = true;
+
+      const thumbTip = landmarks[THUMB_TIP];
+      const wrist = landmarks[WRIST];
+      const middleMcp = landmarks[MIDDLE_MCP];
+      const pinchDist = Math.hypot(thumbTip.x - indexTip.x, thumbTip.y - indexTip.y);
+      const scale = Math.hypot(wrist.x - middleMcp.x, wrist.y - middleMcp.y);
+      const rawPinch = scale < 1e-6 ? isPinching : (pinchDist / scale) < PINCH_THRESHOLD;
+      debouncePinch(rawPinch);
+
+      if (isPinching && activeStroke) {
+        activeStroke.points.push(fingertip);
+      }
+
+      ctx.beginPath();
+      ctx.arc(fingertip[0], fingertip[1], 10, 0, Math.PI * 2);
+      ctx.fillStyle = isPinching ? "#ff3b3b" : "#3bff5c";
+      ctx.fill();
+    } else {
+      lastFound = false;
+      pendingState = null;
+      pendingCount = 0;
+    }
+
+    statusEl.textContent = lastFound
+      ? (isPinching ? "Pinching — drawing" : "Hand tracked — pinch to draw")
+      : "No hand detected";
+  }
+
+  function clearCanvas() {
+    strokes = [];
+    activeStroke = null;
+  }
+
+  function undoLast() {
+    strokes.pop();
+    activeStroke = null;
+  }
+
+  function saveCanvas() {
+    const w = canvas.width, h = canvas.height;
+    const off = document.createElement("canvas");
+    off.width = w;
+    off.height = h;
+    const octx = off.getContext("2d");
+    octx.fillStyle = "#ffffff";
+    octx.fillRect(0, 0, w, h);
+    for (const stroke of strokes) {
+      if (stroke.points.length < 2) continue;
+      octx.strokeStyle = stroke.color;
+      octx.lineWidth = stroke.width;
+      octx.lineCap = "round";
+      octx.lineJoin = "round";
+      octx.beginPath();
+      octx.moveTo(stroke.points[0][0], stroke.points[0][1]);
+      for (let i = 1; i < stroke.points.length; i++) {
+        octx.lineTo(stroke.points[i][0], stroke.points[i][1]);
+      }
+      octx.stroke();
+    }
+    const link = document.createElement("a");
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    link.download = `airdraw_${stamp}.png`;
+    link.href = off.toDataURL("image/png");
+    link.click();
+  }
+
+  window.addEventListener("keydown", (e) => {
+    if (startBtn.disabled === false) return;
+    if (e.key === "c") clearCanvas();
+    else if (e.key === "z") undoLast();
+    else if (e.key === "s") saveCanvas();
+    else if (e.key >= "1" && e.key <= "5") selectColor(Number(e.key) - 1);
+  });
+
+  clearBtn.addEventListener("click", clearCanvas);
+  undoBtn.addEventListener("click", undoLast);
+  saveBtn.addEventListener("click", saveCanvas);
+
+  let camera = null;
+
+  startBtn.addEventListener("click", async () => {
+    startBtn.disabled = true;
+    statusEl.textContent = "Requesting camera access...";
+    try {
+      const hands = new Hands({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+      });
+      hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.6,
+        minTrackingConfidence: 0.6,
+      });
+      hands.onResults(onResults);
+
+      canvas.width = 640;
+      canvas.height = 480;
+
+      camera = new Camera(video, {
+        onFrame: async () => {
+          await hands.send({ image: video });
+        },
+        width: 640,
+        height: 480,
+      });
+      await camera.start();
+
+      clearBtn.disabled = false;
+      undoBtn.disabled = false;
+      saveBtn.disabled = false;
+      startBtn.textContent = "Camera running";
+    } catch (err) {
+      statusEl.textContent = `Camera/model failed to start: ${err.message}`;
+      startBtn.disabled = false;
+    }
+  });
+})();
+</script>
+</body>
+</html>
