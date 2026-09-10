@@ -13,4 +13,4 @@ fi
 source "$VENV_DIR/bin/activate"
 pip install -q -r requirements.txt
 
-python main.py
+python -m airdraw.app
